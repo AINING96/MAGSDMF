@@ -1,0 +1,560 @@
+import torch
+from torch import nn
+import math
+import numpy as np
+from param import parameter_parser
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+from layers import VariLengthInputLayer, EncodeLayer, FeedForwardLayer
+torch.backends.cudnn.enabled = False
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class GraphAttentionLayer(nn.Module):
+    """
+    Simple GAT layer, similar to https://arxiv.org/abs/1710.10903
+    """
+
+    def __init__(self, in_features, out_features, dropout, alpha_GAT, concat=True):
+        super(GraphAttentionLayer, self).__init__()
+        self.dropout = dropout
+        self.in_features = in_features
+        self.out_features = out_features
+        self.alpha_GAT = alpha_GAT
+        self.concat = concat
+
+        self.W = nn.Parameter(torch.empty(size=(in_features, out_features)))
+        nn.init.xavier_uniform_(self.W.data, gain=1.414)
+        self.a = nn.Parameter(torch.empty(size=(2 * out_features, 1)))
+        nn.init.xavier_uniform_(self.a.data, gain=1.414)
+
+        self.leakyrelu = nn.LeakyReLU(self.alpha_GAT)
+
+    def forward(self, h, adj):
+        # print("adj shape:", adj.shape)
+        # print(self.W.shape)
+        # print("h shape:", h.shape)
+        Wh = torch.mm(h, self.W)  # h.shape: (N, in_features), Wh.shape: (N, out_features)
+        # print("Wh shape:", Wh.shape)
+        e = self._prepare_attentional_mechanism_input(Wh)
+        # print("e shape:", e.shape)
+
+        zero_vec = -9e15 * torch.ones_like(e)
+        attention = torch.where(adj > 0, e, zero_vec)
+        attention = F.softmax(attention, dim=1)
+        attention = F.dropout(attention, self.dropout, training=self.training)
+        h_prime = torch.matmul(attention, Wh)
+
+        if self.concat:
+            return F.elu(h_prime)
+        else:
+            return h_prime
+
+    def _prepare_attentional_mechanism_input(self, Wh):
+        # Wh.shape (N, out_feature)
+        # self.a.shape (2 * out_feature, 1)
+        # Wh1&2.shape (N, 1)
+        # e.shape (N, N)
+        Wh1 = torch.matmul(Wh, self.a[:self.out_features, :])
+        Wh2 = torch.matmul(Wh, self.a[self.out_features:, :])
+        # broadcast add
+        e = Wh1 + Wh2.T
+        return self.leakyrelu(e)
+
+    def __repr__(self):
+        return self.__class__.__name__ + ' (' + str(self.in_features) + ' -> ' + str(self.out_features) + ')'
+
+
+class GAT(nn.Module):
+    def __init__(self, nfeat, nhid, nclass, dropout, alpha_GAT, nheads):
+        """Dense version of GAT."""
+        super(GAT, self).__init__()
+        self.dropout = dropout
+
+        self.attentions = [GraphAttentionLayer(nfeat, nhid, dropout=dropout, alpha_GAT=alpha_GAT, concat=True) for _ in
+                           range(nheads)]
+        for i, attention in enumerate(self.attentions):
+            self.add_module('attention_{}'.format(i), attention)
+
+        self.out_att = GraphAttentionLayer(nhid * nheads, nclass, dropout=dropout, alpha_GAT=alpha_GAT, concat=False)
+
+    def forward(self, x, adj):
+        x = F.dropout(x, self.dropout, training=self.training)
+        x = torch.cat([att(x, adj) for att in self.attentions], dim=1)
+        x = F.dropout(x, self.dropout, training=self.training)
+        x = F.elu(self.out_att(x, adj))
+        # print("x size:", x.shape)
+        return x
+
+
+class GraphConvolution(nn.Module):
+
+    def __init__(self, in_features, out_features, residual=True, variant=False):
+        super(GraphConvolution, self).__init__()
+
+        # nfeat, nhid, nclass, dropout, alpha_GAT, nheads
+        # self.gat =  GAT(nfeat, in_features,  in_features, dropout, alpha_GAT, nheads)
+
+        self.variant = variant
+        if self.variant:
+            self.in_features = 2 * in_features
+        else:
+            self.in_features = in_features
+
+        self.out_features = out_features
+        self.residual = residual
+        self.weight = Parameter(torch.FloatTensor(self.in_features, self.out_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.out_features)
+        self.weight.data.uniform_(-stdv, stdv)
+
+    def forward(self, input, adj, h0, lamda, alpha, l):
+        # print("adj size:", adj.shape)
+        # print("input size:", input.shape)
+        theta = math.log(lamda / l + 1)
+        hi = torch.spmm(adj, input)
+        if self.variant:
+            support = torch.cat([hi, h0], 1)
+            r = (1 - alpha) * hi + alpha * h0
+        else:
+            support = (1 - alpha) * hi + alpha * h0
+            r = support
+        output = theta * torch.mm(self.weight, support) + (1 - theta) * r
+        if self.residual:
+            output = output + input
+        return output
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, input_data_dims, hyperpm):
+        super(TransformerEncoder, self).__init__()
+        self.hyperpm = hyperpm
+        self.input_data_dims = input_data_dims
+        self.d_q = hyperpm.n_hidden
+        self.d_k = hyperpm.n_hidden
+        self.d_v = hyperpm.n_hidden
+        self.n_head = hyperpm.n_head
+        self.dropout = hyperpm.dropout
+        self.n_layer = hyperpm.nlayer
+        self.modal_num = hyperpm.nmodal
+        self.d_out = self.d_v * self.n_head * self.modal_num
+
+        self.InputLayer = VariLengthInputLayer(self.input_data_dims, self.d_k, self.d_v, self.n_head, self.dropout)
+
+        self.Encoder = []
+        self.FeedForward = []
+
+        for i in range(self.n_layer):
+            encoder = EncodeLayer(self.d_k * self.n_head, self.d_k, self.d_v, self.n_head, self.dropout)
+            self.add_module('encode_%d' % i, encoder)
+            self.Encoder.append(encoder)
+
+            feedforward = FeedForwardLayer(self.d_v * self.n_head, self.d_v * self.n_head, dropout=self.dropout)
+            self.add_module('feed_%d' % i, feedforward)
+            self.FeedForward.append(feedforward)
+
+
+    def forward(self, x):
+        bs = x.size(0)
+        attn_map = []
+        x, _attn = self.InputLayer(x)
+        attn = _attn.mean(dim=1)
+        attn_map.append(attn.detach().cpu().numpy())
+
+        for i in range(self.n_layer):
+            x, _attn = self.Encoder[i](q=x, k=x, v=x, modal_num=self.modal_num)
+            attn = _attn.mean(dim=1)
+            x = self.FeedForward[i](x)
+            attn_map.append(attn.detach().cpu().numpy())
+
+        x = x.view(bs, -1)
+        # output = self.Outputlayer(x)
+        return x
+
+
+class HGNN_conv(nn.Module):
+    def __init__(self, in_ft, out_ft, bias=True):
+        super(HGNN_conv, self).__init__()
+        self.in_features = in_ft
+        self.out_features = out_ft
+        self.weight = Parameter(torch.Tensor(in_ft, out_ft))
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_ft))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, x, G):
+        x = x.matmul(self.weight)
+        if self.bias is not None:
+            x = x + self.bias
+        x = G.matmul(x)
+        return x
+
+    def __repr__(self):
+        return self.__class__.__name__ + ' (' \
+            + str(self.in_features) + ' -> ' \
+            + str(self.out_features) + ')'
+
+
+class HGCN(nn.Module):
+    def __init__(self, in_dim, hidden_list, dropout=0.1):
+        super(HGCN, self).__init__()
+        self.dropout = dropout
+
+        self.hgnn1 = HGNN_conv(in_dim, hidden_list[0])
+
+    def forward(self, x, G):
+        x_embed = self.hgnn1(x, G)
+        x_embed_1 = F.leaky_relu(x_embed, 0.25)
+
+        return x_embed_1
+
+
+class CL(nn.Module):
+    def __init__(self, alpha = 0.5):
+        super(CL, self).__init__()
+
+        self.tau = 0.5
+        self.alpha = alpha
+
+    def forward(self, zr1, zr2): # , zd1, zd2
+
+        hr1 = self.projection(zr1)
+
+        hr2 = self.projection(zr2)
+
+        # hd1 = self.projection(zd1)
+        #
+        # hd2 = self.projection(zd2)
+
+        loss_r = self.alpha*self.sim(hr1, hr2) + (1-self.alpha)*self.sim(hr2,hr1)
+        # loss_d = self.alpha*self.sim(hd1, hd2) + (1-self.alpha)*self.sim(hd2,hd1)
+
+        return loss_r#, loss_d
+
+    def projection(self, z):
+        fc1 = torch.nn.Linear(217, 64)  # 197; 82; 125
+        fc2 = torch.nn.Linear(64, 217)
+        z = F.elu(fc1(z))
+        return fc2(z)
+
+
+    def norm_sim(self, z1, z2):
+        z1 = F.normalize(z1)
+        z2 = F.normalize(z2)
+        return torch.mm(z1, z2.t())
+
+    def sim(self, z1, z2):
+        f = lambda x: torch.exp(x / self.tau)
+        refl_sim = f(self.norm_sim(z1, z1))
+        between_sim = f(self.norm_sim(z1, z2))
+        loss = -torch.log(between_sim.diag() / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()))
+        loss = loss.sum(dim=-1).mean()
+        return loss
+
+
+class GCNII(nn.Module):
+    def __init__(self, args, alpha_GAT=0.01, nheads = 5):
+        super(GCNII, self).__init__()
+        self.args = args
+
+        # nfeat: self.args.fm/fd; nlayers: self.args.layer; nhidden: self.args.hidden; dropout: self.args.dropout;
+        ##################GAT##########################
+        self.gat1_x = GAT(self.args.fm, self.args.fm, 512, self.args.dropout, alpha_GAT, nheads)
+        self.gat2_x = GAT(512, 512, self.args.fm, self.args.dropout, alpha_GAT, 2)
+
+        self.gat1_y = GAT(self.args.fd, self.args.fd, 512, self.args.dropout, alpha_GAT, nheads)
+        self.gat2_y = GAT(512, 512, self.args.fd, self.args.dropout, alpha_GAT, 2)
+
+        ################## HGCN #########################
+        self.HGCN_mi = HGCN(self.args.fd, [251, 251])
+        self.HGCN_dis = HGCN(self.args.fm, [217, 217])
+
+        #################Self-Attention#################
+        self.Transformer_mi = TransformerEncoder([self.args.fm, self.args.fm], args)
+        self.Transformer_dis = TransformerEncoder([self.args.fd, self.args.fd], args)
+
+        ################GCNII##########
+        self.convs_x = nn.ModuleList()
+        for _ in range(self.args.layer):
+            self.convs_x.append(GraphConvolution(self.args.fm, self.args.fm, variant=self.args.variant))
+        self.fcs_x = nn.ModuleList()
+        self.fcs_x.append(nn.Linear(self.args.fm, self.args.hidden))
+        self.fcs_x.append(nn.Linear(self.args.hidden, self.args.fm))
+        self.gat_x = nn.ModuleList()
+        self.gat_x.append(self.gat1_x)
+        self.gat_x.append(self.gat2_x)
+        self.params1_x = list(self.convs_x.parameters())
+        self.params2_x = list(self.fcs_x.parameters())
+        self.params3_x = list(self.gat_x.parameters())
+
+        self.convs_y = nn.ModuleList()
+        for _ in range(self.args.layer):
+            self.convs_y.append(GraphConvolution(self.args.fd, self.args.fd, variant=self.args.variant))
+        self.fcs_y = nn.ModuleList()
+        self.fcs_y.append(nn.Linear(self.args.fd, self.args.hidden))
+        self.fcs_y.append(nn.Linear(self.args.hidden, self.args.fd))
+        self.gat_y = nn.ModuleList()
+        self.gat_y.append(self.gat1_y)
+        self.gat_y.append(self.gat2_y)
+        self.params1_y = list(self.convs_y.parameters())
+        self.params2_y = list(self.fcs_y.parameters())
+        self.params3_y = list(self.gat_y.parameters())
+
+        self.act_fn = nn.LeakyReLU(0.25)      
+
+
+        self.linear_x_1 = nn.Linear(self.args.n_head * self.args.n_hidden * self.args.nmodal, 256)
+        self.linear_x_2 = nn.Linear(256, 128)
+        self.linear_x_3 = nn.Linear(128, self.args.feature_dim)
+
+        self.linear_y_1 = nn.Linear(self.args.n_head * self.args.n_hidden * self.args.nmodal, 256)
+        self.linear_y_2 = nn.Linear(256, 128)
+        self.linear_y_3 = nn.Linear(128, self.args.feature_dim)
+
+        row_num = self.args.fm  # mi:285; circ:515; lnc:276; 251
+        col_num = self.args.fd  # mi:197; circ:82; lnc:125; 217
+        hidden1 = 128  # 128 256
+        hidden2 = self.args.feature_dim  # 32 48 64 96 128
+        hidden3 = 64
+        self.cl = CL()
+
+        self.row_model = nn.Sequential(
+            nn.Linear(col_num, hidden1),
+            nn.ReLU(),
+            nn.Linear(hidden1, hidden2),
+            # nn.Linear(hidden2, hidden3)
+        )
+
+        self.col_model = nn.Sequential(
+            nn.Linear(row_num, hidden1),
+            nn.ReLU(),
+            nn.Linear(hidden1, hidden2),
+            # nn.Linear(hidden2, hidden3)
+        )
+
+        self.globalAvgPool_x = nn.AvgPool2d((self.args.feature_dim, self.args.fm), (1, 1))
+        self.globalAvgPool_y = nn.AvgPool2d((self.args.feature_dim, self.args.fd), (1, 1))
+
+        self.fc1_x = nn.Linear(in_features=2,
+                               out_features=5 * 2)
+        self.fc2_x = nn.Linear(in_features=5 * 2,
+                               out_features=2)
+
+        self.fc1_y = nn.Linear(in_features=2,
+                               out_features=5 * 2)
+        self.fc2_y = nn.Linear(in_features=5 * 2,
+                               out_features=2)
+
+        self.sigmoidx = nn.Sigmoid()
+        self.sigmoidy = nn.Sigmoid()
+
+        self.cnn_x = nn.Conv1d(in_channels=2,
+                               out_channels=self.args.out_channels,
+                               kernel_size=(self.args.feature_dim, 1),
+                               stride=1,
+                               bias=True)
+        self.cnn_y = nn.Conv1d(in_channels=2,
+                               out_channels=self.args.out_channels,
+                               kernel_size=(self.args.feature_dim, 1),
+                               stride=1,
+                               bias=True)
+
+
+
+    def forward(self, data):
+
+        x_m = torch.randn(self.args.miRNA_number, self.args.fm)
+        x_d = torch.randn(self.args.disease_number, self.args.fd)
+        
+
+
+        x_m_g = self.gat1_x(x_m, data['mm_g']['data_matrix'])
+        x_m_g = self.gat2_x(x_m_g, data['mm_g']['data_matrix'])
+        x_m_s = self.gat1_x(x_m, data['mm_s']['data_matrix'])
+        x_m_s = self.gat2_x(x_m_s, data['mm_s']['data_matrix'])
+        x_m_h = self.gat1_x(x_m, data['mm_h']['data_matrix'])
+        x_m_h = self.gat2_x(x_m_h, data['mm_h']['data_matrix'])
+
+        mg = self.HGCN_mi(data['md_p'], x_m_g)
+        ms = self.HGCN_mi(data['md_p'], x_m_s)
+        mh = self.HGCN_mi(data['md_p'], x_m_h)
+
+
+        XM = torch.cat((mg, ms, mh), 1).t()
+        # XM = torch.cat((x_m_g, x_m_s, x_m_h), 1).t()
+        # XM = torch.cat((layer_inner_x_g, layer_inner_x_s, layer_inner_x_h), 1).t()
+
+        x_d_g = self.gat1_y(x_d, data['dd_g']['data_matrix'])
+        x_d_g = self.gat2_y(x_d_g, data['dd_g']['data_matrix'])
+        x_d_s = self.gat1_y(x_d, data['dd_s']['data_matrix'])
+        x_d_s = self.gat2_y(x_d_s, data['dd_s']['data_matrix'])
+        x_d_h = self.gat1_y(x_d, data['dd_h']['data_matrix'])
+        x_d_h = self.gat2_y(x_d_h, data['dd_h']['data_matrix'])
+
+        dg = self.HGCN_dis(data['md_p'].T, x_d_g)
+        ds = self.HGCN_dis(data['md_p'].T, x_d_s)
+        dh = self.HGCN_dis(data['md_p'].T, x_d_h)
+
+        
+
+        YD = torch.cat((dg, ds, dh), 1).t()
+        
+        x_tranformer_feature = self.Transformer_mi(XM.T)       
+        y_tranformer_feature = self.Transformer_dis(YD.T)
+
+
+        x1 = torch.relu(self.linear_x_1(x_tranformer_feature))
+        x2 = torch.relu(self.linear_x_2(x1))
+        x = torch.relu(self.linear_x_3(x2))
+
+        y1 = torch.relu(self.linear_y_1(y_tranformer_feature))
+        y2 = torch.relu(self.linear_y_2(y1))
+        y = torch.relu(self.linear_y_3(y2))    
+
+
+        X1 = self.row_model(data['md_p'])
+        Y1 = self.col_model(data['md_p'].T)
+        M1 = X1.mm(Y1.t())
+
+        # loss1 = self.cl(M1, data['md_p'])
+
+        for i in range(M1.shape[0]):
+            for j in range(M1.shape[1]):
+                if data['md_p'][i][j] == 1:
+                    M1[i][j] = 1
+
+        X2 = self.row_model(M1)
+        Y2 = self.col_model(M1.T)
+        M2 = X2.mm(Y2.t())
+
+        # loss2 = self.cl(M2, data['md_p'])
+
+        for i in range(M2.shape[0]):
+            for j in range(M2.shape[1]):
+                if data['md_p'][i][j] == 1:
+                    M2[i][j] = 1
+
+        X3 = self.row_model(M2)
+        Y3 = self.col_model(M2.T)
+        # M3 = X3.mm(Y3.t())        
+
+
+
+        X_M = torch.cat((X3, x), 1).t()
+        # print(X_M.shape)
+
+        X_M = X_M.T.view(1, 2, self.args.feature_dim, -1)
+        # print(X_M.shape)
+        x_attenttion = self.globalAvgPool_x(X_M)
+        # print(x_attenttion.shape)
+        x_attenttion = x_attenttion.view(x_attenttion.size(0), -1)
+        # print(x_attenttion.shape)
+        x_attenttion = self.fc1_x(x_attenttion)
+        x_attenttion = torch.relu(x_attenttion)
+        x_attenttion = self.fc2_x(x_attenttion)
+        x_attenttion = self.sigmoidx(x_attenttion)
+        x_attenttion = x_attenttion.view(x_attenttion.size(0), x_attenttion.size(1), 1,
+                                         1)
+        XM_attention = x_attenttion * X_M
+        XM_attention = torch.relu(XM_attention)
+
+        Y_D = torch.cat((Y3, y), 1).t()
+
+        Y_D = Y_D.view(1, 2, self.args.feature_dim, -1)
+        y_attenttion = self.globalAvgPool_y(Y_D)
+        y_attenttion = y_attenttion.view(y_attenttion.size(0), -1)
+        y_attenttion = self.fc1_y(y_attenttion)
+        y_attenttion = torch.relu(y_attenttion)
+        y_attenttion = self.fc2_y(y_attenttion)
+        y_attenttion = self.sigmoidy(y_attenttion)
+        y_attenttion = y_attenttion.view(y_attenttion.size(0), y_attenttion.size(1), 1,
+                                         1)
+        YD_attention = y_attenttion * Y_D
+        # print(YD_attention.shape)
+        YD_attention = torch.relu(YD_attention)
+        # print(YD_attention.shape)
+
+        X_feature = self.cnn_x(XM_attention)
+        # print(X_feature.shape)
+        X_feature = X_feature.view(self.args.miRNA_number, self.args.out_channels).t()  # self.args.out_channels
+
+        Y_feature = self.cnn_y(YD_attention)
+        Y_feature = Y_feature.view(self.args.disease_number, self.args.out_channels).t()  # self.args.out_channels
+
+        # X_feature = X3
+        # Y_feature = Y3
+
+        M = X_feature.t().mm(Y_feature)
+
+        return M#,M1, M2, M3
+
+
+
+
+class DMF(nn.Module):
+    def __init__(self, args):
+        super(DMF, self).__init__()
+        self.args = args
+        row_num = self.args.fm  # mi:285; circ:515; lnc:276; 251,271
+        col_num = self.args.fd  # mi:197; circ:82; lnc:125; 217,218
+        hidden1 = 128  # 128 256
+        hidden2 = 96  # 32 48 64 96 128, 192
+        hidden3 = 64
+        self.cl = CL()       
+        self.row_model = nn.Sequential(
+            nn.Linear(col_num, hidden1),
+            nn.ReLU(),
+            # nn.LeakyReLU(0.25),
+            nn.Linear(hidden1, hidden2),
+            # nn.ReLU(),
+            # nn.Linear(hidden2, hidden3)
+        )
+
+        self.col_model = nn.Sequential(
+            nn.Linear(row_num, hidden1),
+            nn.ReLU(),
+            # nn.LeakyReLU(0.25),
+            nn.Linear(hidden1, hidden2),
+            # nn.ReLU(),
+            # nn.Linear(hidden2, hidden3)
+        )
+
+        
+
+    def forward(self, intial_matrix):  #
+        a = 3
+       
+
+        X1 = self.row_model(intial_matrix)
+        
+        Y1 = self.col_model(intial_matrix.T)
+        
+        M1 = X1.mm(Y1.t())        
+
+        return M1
+
+
+
+def init_model_dict(args):
+    model_dict = {}
+    model_dict["GCNII"] = GCNII(args)
+    model_dict["DMF"] = DMF(args)
+
+
+    return model_dict
+
+def init_optim(model_dict, lr):
+    optim_dict = {}
+    optim_dict['GCNII'] = torch.optim.Adam(model_dict['GCNII'].parameters(), lr=lr)
+    optim_dict['DMF'] = torch.optim.Adam(model_dict['DMF'].parameters(), lr=lr)
+
+    return optim_dict
